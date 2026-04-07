@@ -1,7 +1,7 @@
-# 392
+
 
 ---
-title: "Low-Latency Weighted Index on FPGA with Real-Time Anomaly Detection"
+** "Low-Latency Weighted Index on FPGA with Real-Time Anomaly Detection"
 subtitle: "Combined Capstone Specification — Path A / Path B — DE2-115"
 author: "Capstone Design Document"
 date: "2026"
