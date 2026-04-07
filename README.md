@@ -1,271 +1,1046 @@
+FPGA-Based Low-Latency Index Engine with Real-Time Anomaly Detection Under Burst Market Traffic
 
+1. Project Overview
 
----
-** "Low-Latency Weighted Index on FPGA with Real-Time Anomaly Detection"
-subtitle: "Combined Capstone Specification — Path A / Path B — DE2-115"
-author: "Capstone Design Document"
-date: "2026"
----
+Modern electronic financial markets generate extremely high-rate streams of quote updates, especially during periods of elevated volatility such as market open, earnings releases, macroeconomic announcements, or sudden liquidity shocks. These updates arrive in bursts, often referred to as microbursts, where a very large number of quote changes occur within an extremely short time interval.
 
-\newpage
+Traditional software systems process these updates using CPU threads and operating-system scheduling, which introduces non-deterministic latency and tail-latency spikes under burst traffic. This project aims to solve this problem by designing an FPGA-based low-latency streaming analytics engine that computes a continuously updated weighted market index in real time and performs hardware-based anomaly detection directly on the derived index.
 
-# Executive Summary
+The core idea is to build a deterministic hardware pipeline that performs market aggregation, statistical monitoring, burst buffering, and real-time alert generation with bounded latency.
 
-This document describes a **single capstone project** formed by combining two ideas: a **streaming weighted index engine** driven by replayed market-data–style updates (host-framed records), and a **hardware anomaly detector** operating on **one derived time series** to keep scope feasible in approximately **ten weeks**.
+2. High-Level System Architecture
 
-**Recommended merge (Path A):** compute the **weighted index** in the FPGA, then run **rolling-window statistics** (velocity, deviation from a short-term mean) on **the index only**, with **graded LED alerts** and **7-segment display** output on the **Terasic DE2-115** board.
+The full system consists of four major stages:
 
-**Input (system):** Host-replayed **PCAP-derived or synthetic** traffic, reduced to a **simple binary record format** per quote update.
+Host Replay → Burst FIFO → Index Engine → Statistical Monitor → Alerts / Displays
 
-**Output (system):** Continuous **index value**; **anomaly alarm state** and **displayed metrics**; optional **UART log** for latency and verification plots.
+Each stage solves a specific real-world systems problem.
 
-\newpage
+The host software replays market data from historical PCAP captures or synthetic traffic and converts it into a simplified binary quote-update record format.
 
-# 1. Problem Statement
+The FPGA receives this stream and first stores incoming records in an input burst FIFO, which absorbs traffic spikes and prevents pipeline stalls during microbursts.
 
-Modern electronic markets emit **high-rate**, **bursty** streams of quote updates. Systems that derive actionable quantities (here: a **weighted index**) must do so with **low latency** and, for many designs, **predictable behavior under microbursts**—not only good average throughput.
+The next stage computes the weighted market index in real time.
 
-Software-only paths introduce **OS scheduling jitter** and less predictable worst-case delay. An **FPGA** can offer **cycle-accurate** control, **deterministic pipelining**, and **on-chip state** for many symbols, with explicit **FIFO depth** and **backpressure** behavior under stress.
+The final stage performs anomaly detection on the index time series using rolling-window statistics.
 
-Separately, **anomaly-style monitoring** (large short-term move vs. recent baseline) is often needed as a **tripwire** on a derived price series. Doing this in **hardware** next to the index register keeps **alert latency** bounded relative to a thread scheduled on a CPU.
+3. Input Data and Quote Updates
 
-This capstone **does not** implement a full exchange **TCP/network stack** on the FPGA. The **host** replays captures, extracts fields, and streams **framed records** to the FPGA—matching realistic industry splits (smart NIC / feed normalizer vs. FPGA accelerator) while fitting the **academic timeline**.
+Each incoming quote update represents a market change for a tracked symbol.
 
-\newpage
+For this project, each record should contain:
 
-# 2. Target Platform
+- symbol_id
+- bid price
+- ask price
+- optional timestamp
 
-| Item | Detail |
-|------|--------|
-| Board | **Terasic DE2-115** (Altera/Intel **Cyclone IV EP4CE115**) |
-| Tools | **Quartus Prime** (device family Cyclone IV E), **ModelSim** or Questasim (per course license) |
-| Host link | **UART** typical for framed records; optional second UART or logging for metrics |
-| I/O for demo | **LEDs** (graded alert), **7-segment displays** (index / deviation / velocity), **slide switches** (runtime thresholds) |
+Example:
 
-*Note: The DE2-115 exposes **Ethernet PHY** hardware; using a full **MAC + stack** on-chip is **not** assumed in the baseline scope unless the course supplies reference IP and lab time.*
+AAPL, 19320, 19322
 
-\newpage
+where prices are stored as scaled integers for fixed-point arithmetic.
 
-# 3. What the "Combined Project" Is
-
-The design is **one pipeline, two stages**, solving two problems:
-
-1. **Aggregation** — Turn many **quote updates** into **one number**: a **weighted index** \(I_t\) that updates when any **tracked** symbol’s mid changes.
-2. **Monitoring** — On **one time series** (Path A: **the index**), compute **short-horizon velocity** and **deviation from a rolling mean**, compare to **thresholds**, and drive **visible alerts**.
-
-**Why merge this way:** Anomaly logic on **every** symbol scales as **O(N)** duplicate windows (memory, multipliers, control). Anomaly on **the index only** stays **O(1)** in \(N\) for the detector while still using a **multi-symbol** streaming path for realism.
-
-\newpage
-
-# 4. Inputs and Outputs (System Boundaries)
-
-## 4.1 Host → FPGA (digital input stream)
-
-**Goal:** Deliver an unambiguous stream: “symbol *s* has a new **bid** and **ask**.”
-
-### 4.1.1 Framed record (course-defined)
-
-The team **defines** a fixed binary layout, for example:
-
-| Field | Description |
-|-------|----------------|
-| `symbol_id` | Small integer \(0 \ldots N-1\) or compact encoding |
-| `bid` | Fixed-point / scaled integer |
-| `ask` | Fixed-point / scaled integer |
-| Optional | Sync byte, length, simple CRC, `valid` framing |
-
-**Source of records:**
-
-- **PCAP replay:** Software parses packets and **extracts** quote fields, then **emits** framed records (recommended for realism).
-- **Synthetic:** Script generates byte-identical records for golden testing.
-
-**Rationale:** Raw **SoupBinTCP / TCP** termination on the FPGA is a **large** separate project; the host **normalizes** external formats into this **academic** interface.
-
-## 4.2 FPGA → Human (DE2-115 outputs)
-
-| Output | Purpose |
-|--------|---------|
-| **7-segment displays** | Show e.g. **scaled index**, **deviation**, or **velocity** (pick what reads best live) |
-| **LEDs** | **Graded anomaly alert** (e.g. green / yellow / red bands from threshold breaches) |
-| **Slide switches** | **Runtime thresholds** \(T_v\), \(T_d\) (and mode bits if needed) |
-
-## 4.3 Optional FPGA → Host (logging)
-
-Same **UART** (or alternate channel) to stream tuples for plots:
-
-- Cycle or timestamp
-- Current **index**
-- Alert level
-- Optional per-message **latency** in cycles
-
-\newpage
-
-# 5. Financial / Numeric Definitions
-
-## 5.1 Midprice
-
-For symbol \(i\) with best bid \(B_i\) and best ask \(A_i\) (in fixed-point integers):
+The FPGA computes the symbol midprice as:
 
 \[
-m_i = \frac{B_i + A_i}{2}
+m_i = \frac{bid_i + ask_i}{2}
 \]
 
-In RTL, often implemented as **arithmetic right shift** with a documented scale (e.g. tick size × \(10^k\)).
+This midprice becomes the symbol’s contribution to the index.
 
-## 5.2 Weighted index
+4. Weighted Index Engine
 
-Let weights \(w_i\) satisfy \(\sum_i w_i = 1\) in real arithmetic; on FPGA use **fixed-point weights** (e.g. Q16 or sum to a power of two for cheap normalization).
+The weighted index is the primary computed output of the system.
+
+It represents one continuously updated market-wide value derived from multiple symbols.
+
+The full definition is:
 
 \[
-I = \sum_i w_i \, m_i
+I_t = \sum_{i=1}^{N} w_i m_i
 \]
 
-## 5.3 Incremental update (efficient)
+where:
 
-When only symbol \(k\) updates, avoid recomputing the full sum each time. Store previous mid \(m_k^{\mathrm{old}}\) (or stored contribution \(C_k = w_k m_k\)).
+N = number of tracked symbols  
+w_i = symbol weight  
+m_i = current symbol midprice  
+
+This can represent a simplified NASDAQ-like index.
+
+Important Design Suggestion: Incremental Index Update
+
+Rather than recomputing the full summation every tick, the FPGA should use an incremental update architecture.
+
+This is one of the most important design optimizations.
+
+Instead of:
 
 \[
-I \leftarrow I - w_k m_k^{\mathrm{old}} + w_k m_k^{\mathrm{new}}
+I_t = \sum_i w_i m_i
 \]
 
-Then update stored state for symbol \(k\).
-
-\newpage
-
-# 6. FPGA Internal Architecture (Detailed)
-
-## 6.1 Stage 1 — Ingress, parse, filter
-
-| Step | Function |
-|------|-----------|
-| Ingress | UART RX → byte FIFO → frame assembler |
-| Parse | Extract `symbol_id`, `bid`, `ask` |
-| Filter | If `symbol_id` not in **index universe**, **drop** (no state / index change) |
-
-**Goal:** Pay only for symbols that contribute to \(I\).
-
-## 6.2 Stage 2 — Per-symbol state and mid
-
-For each universe symbol, storage holds latest \(B_i, A_i\) (or only \(m_i\)). On accepted update, compute \(m_i\) in fixed-point.
-
-## 6.3 Stage 3 — Weighted index
-
-Maintain running \(I\) using **incremental** updates. Initialize \(I\) after first valid mids (e.g. cold-start rule: require all symbols touched once, or use last known mids and document).
-
-## 6.4 Stage 4 — Latency and microburst instrumentation
-
-Per accepted record:
-
-- Latch **free-running cycle counter** at **record accepted**.
-- Latch again when **index update** completes (same clock domain as design permits).
-
-**Difference** → processing delay in **cycles**; multiply by clock period for **nanoseconds**. The host replays **bursts** to characterize **average vs tail** delay and **FIFO stress**.
-
-## 6.5 Stage 5 — Anomaly detection (Project 2 style, single stream)
-
-### Path A (recommended)
-
-**Input series:** \(I_0, I_1, \ldots\) each time the **index changes** (or on a fixed cadence—**choose one rule** and document it).
-
-**Typical features (fixed-point):**
-
-- **Rolling mean** \(\mu_t\) over window \(W\) on **levels** \(I_t\) or on **returns** \(\Delta I_t = I_t - I_{t-1}\).
-- **Deviation:** \(d_t = I_t - \mu_t\) (or demeaned returns).
-- **Velocity:** e.g. \(v_t = I_t - I_{t-1}\), or short EMA of \(|\Delta I|\).
-
-**Example alert rule (illustrative):**
+every update, use:
 
 \[
-|v_t| > T_v \quad \land \quad |d_t| > T_d \quad \Rightarrow \quad \text{escalate LED state}
+I_{new} = I_{old} + w_i\left(m_{i,new} - m_{i,old}\right)
 \]
 
-\(T_v, d_d\) derived from **slide switches** (quantized) for demo.
+This dramatically reduces latency and logic usage.
 
-**Important:** This is a **transparent tripwire**, not a claim of optimal crash prediction—appropriate for academic scope.
+Only the symbol that changed needs to update the index.
 
-### Path B (optional variant)
+This is likely the best architecture for your capstone.
 
-Same **index pipeline** for the finance story, but the **detector** runs on **one constituent** \(m_{K,t}\) (e.g. largest weight). **Harder to explain** for audiences: two focal series (constituent vs index) unless the report is very clear.
+5. Burst FIFO (Strong Recommendation)
 
-\newpage
+This is one of my strongest suggestions to include.
 
-# 7. Path A vs Path B (Comparison)
+During market microbursts, quote updates may arrive faster than the computation pipeline can process in a single cycle.
 
-| Aspect | Path A — Anomaly on **index** | Path B — Anomaly on **one stock** |
-|--------|--------------------------------|-------------------------------------|
-| Detector complexity | **One** window, one mean pipeline | **One** window (same HW), different input tap |
-| Narrative | “Alert on **portfolio-level** dislocation” | “Alert on **flagship** name during replay” |
-| Dilution | Large move in one name may be diluted if others flat | Localized to one ticker |
-| Demo clarity | **Simplest** to present | Needs careful labeling in UI/report |
+To handle this, the FPGA should include an input FIFO buffer.
 
-**Recommendation:** **Path A** as default; Path B only if the team wants a specific **flash-crash** story on one ticker and accepts extra exposition.
+Purpose:
 
-\newpage
+- absorb burst traffic
+- smooth incoming stream
+- prevent dropped records
+- preserve deterministic pipeline timing
 
-# 8. Scope Caps (Explicit)
+Architecture:
 
-To finish in **~10 weeks** on **DE2-115**:
+UART RX → FIFO → parser → index engine
 
-| Cap | Rationale |
-|-----|-----------|
-| **One** logical quote / record type | Limits parser FSM and verification |
-| **Modest universe** (e.g. **8–32** symbols) | BRAM/register budget and incremental update debugging |
-| **Anomaly on one series** (index in Path A) | Avoids **N** rolling windows |
-| Host does PCAP → framed records | Avoids full TCP on FPGA |
-| Fixed-point throughout | Predictable RTL, no floating-point cores required |
+This also lets you study:
 
-\newpage
+- FIFO occupancy
+- queue depth under bursts
+- latency vs burst size
 
-# 9. Deliverables Checklist
+This gives strong systems-level analysis for your final report.
 
-| Deliverable | Description |
-|-------------|-------------|
-| RTL | Verilog or SystemVerilog: UART/framing, parse/filter, mids, incremental index, anomaly, LED/7-seg/switch glue |
-| Testbench | ModelSim: golden vectors from host or Python reference |
-| Host tools | PCAP or synthetic **replay**; **software reference** index + optional reference anomaly |
-| Metrics | Resource utilization (Quartus), **Fmax**, **throughput**, latency plots under burst |
-| Demo | Live DE2-115: index + graded alert under replay |
-| Report | Diagrams, message format spec, fixed-point scales, limitations |
+You should absolutely include performance plots such as:
 
-\newpage
+- burst size vs latency
+- burst size vs FIFO occupancy
 
-# 10. Suggested Milestones (10 Weeks)
+This strengthens the research component significantly.
 
-| Week | Focus |
-|------|--------|
-| 1 | Freeze **record format**, weights, universe size; reference model outputs golden files |
-| 2–3 | UART + parser + filter + per-symbol mids (simulation) |
-| 4–5 | Incremental **weighted index**; match software reference |
-| 6 | Ingress FIFO + **cycle-accurate latency** counters; burst tests in sim |
-| 7 | Anomaly block + switch thresholds + LED / 7-seg integration |
-| 8 | Quartus synthesis, timing, pin assignments for DE2-115 |
-| 9 | End-to-end replay + plots + corner cases (bad length, unknown symbol) |
-| 10 | Final report, poster, demo polish |
+6. Rolling Statistical Monitor
 
-\newpage
+After computing the index, the system treats the index as a streaming time series.
 
-# 11. Compliance and Data (Academic)
+Example live index values:
 
-- Use **publicly documented** PCAP or **synthetic** traffic; **cite** dataset URL, date, and license in the report.
-- Do not submit **employer proprietary** code, specifications, or non-public data as part of graded work unless explicitly permitted.
-- Index **weights** and **universe** are **project parameters**, not claims about a real published index unless you license and document them.
+1253.40  
+1253.44  
+1253.49  
+1252.80  
+1249.10  
 
-\newpage
+These are the current index values over time.
 
-# 12. One-Sentence Project Goal (Proposal-Ready)
+This is what I meant when I said the “index changed.”
 
-**Input:** Replay of quote updates as **host-framed binary records**. **Output:** A **continuous fixed-point weighted index** on the FPGA, **measured processing latency** under burst replay, and **real-time graded anomaly indication** when short-term **index motion** exceeds **switch-programmed thresholds**, with verification against a **software reference**.
+The FPGA stores recent index values in a rolling window.
 
-\newpage
+Power-of-Two Rolling Window (Strong Recommendation)
 
-# References (Placeholders — Replace With Your Citations)
+Use a power-of-two window size.
 
-- Terasic DE2-115 documentation and user manual.
-- Intel Quartus Prime documentation, Cyclone IV device handbook.
-- Public market microstructure texts (e.g. Harris, Hasbrouck) for **motivation only**.
-- SEC / academic reports on market events if used for **narrative** only (Path B / flash-crash context): cite properly.
-- IEEE papers suggested by the course (anomaly / market monitoring): cite if used.
+Recommended:
 
----
+8  
+16  
+32  
 
-*End of document.*
+Best recommendation:
+
+16
+
+This is because the rolling mean becomes a bit shift.
+
+For window size 16:
+
+\[
+\mu_t = \frac{1}{16}\sum_{k=0}^{15} I_{t-k}
+\]
+
+Division by 16 is simply:
+
+>> 4
+
+which is extremely FPGA-friendly.
+
+This is a very important implementation optimization.
+
+7. Statistical Metrics
+
+The detector computes two quantities.
+
+Velocity
+
+This measures instantaneous market movement.
+
+\[
+v_t = I_t - I_{t-1}
+\]
+
+Large velocity indicates sudden market movement.
+
+Deviation
+
+This measures distance from recent average.
+
+\[
+d_t = \left|I_t - \mu_t\right|
+\]
+
+This identifies whether the current market state is far from normal behavior.
+
+8. Threshold Architecture
+
+Use two independent thresholds.
+
+This is very important.
+
+T_v for velocity
+
+T_d for deviation
+
+T_v, T_d
+
+The detection condition becomes:
+
+\[
+|v_t| > T_v \text{ and } d_t > T_d
+\]
+
+These should be controlled independently using slide switches.
+
+Example:
+
+switches 0–7 → velocity threshold  
+switches 8–15 → deviation threshold  
+
+Excellent demo feature.
+
+9. Multiplexed 7-Segment Display (Strong Recommendation)
+
+This is another strong improvement.
+
+Rather than showing only index, use a mode-select switch.
+
+Suggested modes:
+
+mode 0 → index  
+mode 1 → velocity  
+mode 2 → deviation  
+mode 3 → FIFO depth  
+
+This makes the demo much stronger.
+
+Professor can immediately inspect internal states.
+
+Keep this in final architecture.
+
+10. Design Decisions to Think About
+
+These are important discussion points for partner/professor meetings.
+
+Fixed-point precision
+
+Decide scale factor:
+
+x100  
+x1000  
+x10000  
+
+This affects arithmetic precision.
+
+Symbol universe size
+
+How many symbols?
+
+Suggested:
+
+8–16 symbols
+
+Good balance for capstone scope.
+
+Burst testing methodology
+
+Test normal traffic vs burst traffic.
+
+Example scenarios:
+
+1 tick / cycle  
+4 ticks / cycle burst  
+16 tick replay burst  
+Latency measurement  
+
+Very important final metric.
+
+Measure:
+
+input arrival → index update  
+input arrival → LED alert  
+
+This should be part of final plots.
+FPGA-Based Low-Latency Index Engine with Real-Time Anomaly Detection Under Burst Market Traffic
+1. Project Overview
+
+Modern electronic financial markets generate extremely high-rate streams of quote updates, especially during periods of elevated volatility such as market open, earnings releases, macroeconomic announcements, or sudden liquidity shocks. These updates arrive in bursts, often referred to as microbursts, where a very large number of quote changes occur within an extremely short time interval.
+
+Traditional software systems process these updates using CPU threads and operating-system scheduling, which introduces non-deterministic latency and tail-latency spikes under burst traffic. This project aims to solve this problem by designing an FPGA-based low-latency streaming analytics engine that computes a continuously updated weighted market index in real time and performs hardware-based anomaly detection directly on the derived index.
+
+The core idea is to build a deterministic hardware pipeline that performs market aggregation, statistical monitoring, burst buffering, and real-time alert generation with bounded latency.
+
+2. High-Level System Architecture
+
+The full system consists of four major stages:
+
+Host Replay → Burst FIFO → Index Engine → Statistical Monitor → Alerts / Displays
+
+Each stage solves a specific real-world systems problem.
+
+The host software replays market data from historical PCAP captures or synthetic traffic and converts it into a simplified binary quote-update record format.
+
+The FPGA receives this stream and first stores incoming records in an input burst FIFO, which absorbs traffic spikes and prevents pipeline stalls during microbursts.
+
+The next stage computes the weighted market index in real time.
+
+The final stage performs anomaly detection on the index time series using rolling-window statistics.
+
+3. Input Data and Quote Updates
+
+Each incoming quote update represents a market change for a tracked symbol.
+
+For this project, each record should contain:
+
+symbol_id
+bid price
+ask price
+optional timestamp
+
+Example:
+
+AAPL, 19320, 19322
+
+where prices are stored as scaled integers for fixed-point arithmetic.
+
+The FPGA computes the symbol midprice as:
+
+𝑚
+𝑖
+=
+𝑏
+𝑖
+𝑑
+𝑖
++
+𝑎
+𝑠
+𝑘
+𝑖
+2
+m
+i
+	​
+
+=
+2
+bid
+i
+	​
+
++ask
+i
+	​
+
+	​
+
+
+𝑚
+𝑖
+=
+𝑏
+𝑖
+𝑑
+𝑖
++
+𝑎
+𝑠
+𝑘
+𝑖
+2
+m
+i
+	​
+
+=
+2
+bid
+i
+	​
+
++ask
+i
+	​
+
+	​
+
+
+This midprice becomes the symbol’s contribution to the index.
+
+4. Weighted Index Engine
+
+The weighted index is the primary computed output of the system.
+
+It represents one continuously updated market-wide value derived from multiple symbols.
+
+The full definition is:
+
+𝐼
+𝑡
+=
+∑
+𝑖
+=
+1
+𝑁
+𝑤
+𝑖
+𝑚
+𝑖
+I
+t
+	​
+
+=
+i=1
+∑
+N
+	​
+
+w
+i
+	​
+
+m
+i
+	​
+
+
+𝐼
+𝑡
+=
+∑
+𝑖
+=
+1
+𝑁
+𝑤
+𝑖
+𝑚
+𝑖
+I
+t
+	​
+
+=∑
+i=1
+N
+	​
+
+w
+i
+	​
+
+m
+i
+	​
+
+
+where:
+
+𝑁
+N = number of tracked symbols
+𝑤
+𝑖
+w
+i
+	​
+
+ = symbol weight
+𝑚
+𝑖
+m
+i
+	​
+
+ = current symbol midprice
+
+This can represent a simplified NASDAQ-like index.
+
+Important Design Suggestion: Incremental Index Update
+
+Rather than recomputing the full summation every tick, the FPGA should use an incremental update architecture.
+
+This is one of the most important design optimizations.
+
+Instead of:
+
+𝐼
+𝑡
+=
+∑
+𝑤
+𝑖
+𝑚
+𝑖
+I
+t
+	​
+
+=∑w
+i
+	​
+
+m
+i
+	​
+
+
+every update, use:
+
+𝐼
+𝑛
+𝑒
+𝑤
+=
+𝐼
+𝑜
+𝑙
+𝑑
++
+𝑤
+𝑖
+(
+𝑚
+𝑖
+𝑛
+𝑒
+𝑤
+−
+𝑚
+𝑖
+𝑜
+𝑙
+𝑑
+)
+I
+new
+	​
+
+=I
+old
+	​
+
++w
+i
+	​
+
+(m
+i
+new
+	​
+
+−m
+i
+old
+	​
+
+)
+
+𝐼
+𝑛
+𝑒
+𝑤
+=
+𝐼
+𝑜
+𝑙
+𝑑
++
+𝑤
+𝑖
+(
+𝑚
+𝑖
+𝑛
+𝑒
+𝑤
+−
+𝑚
+𝑖
+𝑜
+𝑙
+𝑑
+)
+I
+new
+	​
+
+=I
+old
+	​
+
++w
+i
+	​
+
+(m
+i
+new
+	​
+
+−m
+i
+old
+	​
+
+)
+
+This dramatically reduces latency and logic usage.
+
+Only the symbol that changed needs to update the index.
+
+This is likely the best architecture for your capstone.
+
+5. Burst FIFO (Strong Recommendation)
+
+This is one of my strongest suggestions to include.
+
+During market microbursts, quote updates may arrive faster than the computation pipeline can process in a single cycle.
+
+To handle this, the FPGA should include an input FIFO buffer.
+
+Purpose:
+
+absorb burst traffic
+smooth incoming stream
+prevent dropped records
+preserve deterministic pipeline timing
+
+Architecture:
+
+UART RX → FIFO → parser → index engine
+
+This also lets you study:
+
+FIFO occupancy
+queue depth under bursts
+latency vs burst size
+
+This gives strong systems-level analysis for your final report.
+
+You should absolutely include performance plots such as:
+
+burst size vs latency
+burst size vs FIFO occupancy
+
+This strengthens the research component significantly.
+
+6. Rolling Statistical Monitor
+
+After computing the index, the system treats the index as a streaming time series.
+
+Example live index values:
+
+1253.40
+1253.44
+1253.49
+1252.80
+1249.10
+
+These are the current index values over time.
+
+This is what I meant when I said the “index changed.”
+
+The FPGA stores recent index values in a rolling window.
+
+Power-of-Two Rolling Window (Strong Recommendation)
+
+Use a power-of-two window size.
+
+Recommended:
+
+8
+16
+32
+
+Best recommendation:
+
+16
+
+This is because the rolling mean becomes a bit shift.
+
+For window size 16:
+
+𝜇
+𝑡
+=
+1
+16
+∑
+𝑘
+=
+0
+15
+𝐼
+𝑡
+−
+𝑘
+μ
+t
+	​
+
+=
+16
+1
+	​
+
+k=0
+∑
+15
+	​
+
+I
+t−k
+	​
+
+
+𝜇
+𝑡
+=
+1
+16
+∑
+𝑘
+=
+0
+15
+𝐼
+𝑡
+−
+𝑘
+μ
+t
+	​
+
+=
+16
+1
+	​
+
+∑
+k=0
+15
+	​
+
+I
+t−k
+	​
+
+
+Division by 16 is simply:
+
+>> 4
+
+which is extremely FPGA-friendly.
+
+This is a very important implementation optimization.
+
+7. Statistical Metrics
+
+The detector computes two quantities.
+
+Velocity
+
+This measures instantaneous market movement.
+
+𝑣
+𝑡
+=
+𝐼
+𝑡
+−
+𝐼
+𝑡
+−
+1
+v
+t
+	​
+
+=I
+t
+	​
+
+−I
+t−1
+	​
+
+
+𝑣
+𝑡
+=
+𝐼
+𝑡
+−
+𝐼
+𝑡
+−
+1
+v
+t
+	​
+
+=I
+t
+	​
+
+−I
+t−1
+	​
+
+
+Large velocity indicates sudden market movement.
+
+Deviation
+
+This measures distance from recent average.
+
+𝑑
+𝑡
+=
+∣
+𝐼
+𝑡
+−
+𝜇
+𝑡
+∣
+d
+t
+	​
+
+=∣I
+t
+	​
+
+−μ
+t
+	​
+
+∣
+
+𝑑
+𝑡
+=
+∣
+𝐼
+𝑡
+−
+𝜇
+𝑡
+∣
+d
+t
+	​
+
+=∣I
+t
+	​
+
+−μ
+t
+	​
+
+∣
+
+This identifies whether the current market state is far from normal behavior.
+
+8. Threshold Architecture
+
+Use two independent thresholds.
+
+This is very important.
+
+𝑇
+𝑣
+T
+v
+	​
+
+
+for velocity
+
+𝑇
+𝑑
+T
+d
+	​
+
+
+for deviation
+
+𝑇
+𝑣
+,
+𝑇
+𝑑
+T
+v
+	​
+
+,T
+d
+	​
+
+
+The detection condition becomes:
+
+∣
+𝑣
+𝑡
+∣
+>
+𝑇
+𝑣
+and
+𝑑
+𝑡
+>
+𝑇
+𝑑
+∣v
+t
+	​
+
+∣>T
+v
+	​
+
+andd
+t
+	​
+
+>T
+d
+	​
+
+
+∣
+𝑣
+𝑡
+∣
+>
+𝑇
+𝑣
+and
+𝑑
+𝑡
+>
+𝑇
+𝑑
+∣v
+t
+	​
+
+∣>T
+v
+	​
+
+andd
+t
+	​
+
+>T
+d
+	​
+
+
+These should be controlled independently using slide switches.
+
+Example:
+
+switches 0–7 → velocity threshold
+switches 8–15 → deviation threshold
+
+Excellent demo feature.
+
+9. Multiplexed 7-Segment Display (Strong Recommendation)
+
+This is another strong improvement.
+
+Rather than showing only index, use a mode-select switch.
+
+Suggested modes:
+
+mode 0 → index
+mode 1 → velocity
+mode 2 → deviation
+mode 3 → FIFO depth
+
+This makes the demo much stronger.
+
+Professor can immediately inspect internal states.
+
+Keep this in final architecture.
+
+10. Design Decisions to Think About
+
+These are important discussion points for partner/professor meetings.
+
+Fixed-point precision
+
+Decide scale factor:
+
+x100
+x1000
+x10000
+
+This affects arithmetic precision.
+
+Symbol universe size
+
+How many symbols?
+
+Suggested:
+
+8–16 symbols
+
+Good balance for capstone scope.
+
+Burst testing methodology
+
+Test normal traffic vs burst traffic.
+
+Example scenarios:
+
+1 tick / cycle
+4 ticks / cycle burst
+16 tick replay burst
+Latency measurement
+
+Very important final metric.
+
+Measure:
+
+input arrival → index update
+input arrival → LED alert
+
+This should be part of final plots.
