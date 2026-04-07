@@ -43,9 +43,7 @@ where prices are stored as scaled integers for fixed-point arithmetic.
 
 The FPGA computes the symbol midprice as:
 
-\[
-m_i = \frac{bid_i + ask_i}{2}
-\]
+mi = (bidi + aski) / 2
 
 This midprice becomes the symbol’s contribution to the index.
 
@@ -57,9 +55,7 @@ It represents one continuously updated market-wide value derived from multiple s
 
 The full definition is:
 
-\[
-I_t = \sum_{i=1}^{N} w_i m_i
-\]
+It = sum_{i=1..N} (wi * mi)
 
 where:
 
@@ -77,15 +73,11 @@ This is one of the most important design optimizations.
 
 Instead of:
 
-\[
-I_t = \sum_i w_i m_i
-\]
+It = sum_i (wi * mi)
 
 every update, use:
 
-\[
-I_{new} = I_{old} + w_i\left(m_{i,new} - m_{i,old}\right)
-\]
+Inew = Iold + wi * (mi_new - mi_old)
 
 This dramatically reduces latency and logic usage.
 
@@ -163,9 +155,7 @@ This is because the rolling mean becomes a bit shift.
 
 For window size 16:
 
-\[
-\mu_t = \frac{1}{16}\sum_{k=0}^{15} I_{t-k}
-\]
+mUt = (1/16) * sum_{k=0..15} It-k
 
 Division by 16 is simply:
 
@@ -183,9 +173,7 @@ Velocity
 
 This measures instantaneous market movement.
 
-\[
-v_t = I_t - I_{t-1}
-\]
+vt = It - It-1
 
 Large velocity indicates sudden market movement.
 
@@ -193,9 +181,7 @@ Deviation
 
 This measures distance from recent average.
 
-\[
-d_t = \left|I_t - \mu_t\right|
-\]
+dt = |It - mUt|
 
 This identifies whether the current market state is far from normal behavior.
 
@@ -213,9 +199,7 @@ T_v, T_d
 
 The detection condition becomes:
 
-\[
-|v_t| > T_v \text{ and } d_t > T_d
-\]
+|vt| > Tv and dt > Td
 
 These should be controlled independently using slide switches.
 
@@ -288,8 +272,6 @@ input arrival → index update
 input arrival → LED alert  
 
 This should be part of final plots.
-FPGA-Based Low-Latency Index Engine with Real-Time Anomaly Detection Under Burst Market Traffic
-1. Project Overview
 
 Modern electronic financial markets generate extremely high-rate streams of quote updates, especially during periods of elevated volatility such as market open, earnings releases, macroeconomic announcements, or sudden liquidity shocks. These updates arrive in bursts, often referred to as microbursts, where a very large number of quote changes occur within an extremely short time interval.
 
