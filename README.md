@@ -1,4 +1,4 @@
-FPGA-Based Low-Latency Index Engine with Real-Time Anomaly Detection Under Burst Market Traffic
+Real-Time FPGA Market Index and Anomaly Detection Engine
 
 1. Project Overview
 
