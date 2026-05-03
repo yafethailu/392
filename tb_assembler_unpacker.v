@@ -93,14 +93,15 @@ module tb_assembler_unpacker;
             // wait for the 1-cycle record_valid pulse
             while (!record_valid) @(posedge clk);
             if (symbol_id !== exp_sym || bid_q9 !== exp_bid || ask_q9 !== exp_ask) begin
-                $display("FAIL: got sym=%0d bid=%0d ask=%0d "
-                         "(exp %0d/%0d/%0d)",
+                $display("FAIL: got sym=%0d bid=%0d ask=%0d (exp %0d/%0d/%0d)",
                          symbol_id, bid_q9, ask_q9, exp_sym, exp_bid, exp_ask);
                 errors = errors + 1;
             end else begin
-                $display(" OK : sym=%0d bid=%0d ask=%0d",
-                         symbol_id, bid_q9, ask_q9);
+                $display(" OK : sym=%0d bid=%0d ask=%0d", symbol_id, bid_q9, ask_q9);
             end
+            // Step past the current pulse so the next check_record waits
+            // for a NEW record_valid, not the same one.
+            @(posedge clk);
         end
     endtask
 
